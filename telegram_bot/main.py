@@ -4,7 +4,7 @@ from aiogram.filters import Command
 from playwright.async_api import async_playwright
 import re
 
-TOKEN = "8931616705:AAG7AKqvPmXCMmAHkl9uyXTiuS6bWsKGNPg"
+TOKEN = ""
 URL = "https://web.max.ru/"  # замени на сайт
 
 

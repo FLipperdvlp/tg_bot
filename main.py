@@ -2252,15 +2252,7 @@ async def handle_photo(
                 sent_at,
                 counted
             )
-            VALUES (
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s
-            )
+            VALUES (%s, %s, %s, %s, %s, %s)
             """,
             (
                 chat.id,
@@ -2294,7 +2286,7 @@ async def handle_photo(
     # -----------------------------------------------------
 
     logger.info(
-        "%s QR: %s (%s) | %s",
+        "%s QR: %s (%s)",
         (
             "COUNTED"
             if counted

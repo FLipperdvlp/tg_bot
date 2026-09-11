@@ -2294,7 +2294,6 @@ async def handle_photo(
         ),
         display_name,
         user.id,
-        qr_data[:200],
     )
 
 

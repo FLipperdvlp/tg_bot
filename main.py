@@ -1,31 +1,21 @@
 import logging
-
-import sqlite3
-
 import io
-
 import os
-
 import threading
-
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
-import cv2
-
-import numpy as np
-
 from datetime import datetime, timezone
 
+import cv2
+import numpy as np
+import psycopg2
+import psycopg2.extras
+
 from telegram.error import BadRequest
-
-from config import BOT_TOKEN, OWNER_USERNAME
-
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,6 +24,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+from config import BOT_TOKEN, OWNER_USERNAME
+
 
 TECHNICAL_BREAK_TEXT = (
     "🛠 <b>Технический перерыв</b>\n\n"
@@ -44,20 +37,142 @@ TECHNICAL_BREAK_TEXT = (
     "Перерыв продлится до 10 минут."
 )
 
-DB_FILE = "bot.db"
+
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
+# =========================================================
+# POSTGRESQL
+# =========================================================
 
-# Только для Render Web Service.
-# Бот продолжает работать через Telegram polling как раньше.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL не задана. "
+        "Добавь DATABASE_URL в Environment Variables Render."
+    )
+
+
+def get_db():
+    """
+    Создаёт новое подключение к PostgreSQL.
+    """
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+        connect_timeout=10,
+    )
+
+
+def init_db():
+    """
+    Создаёт необходимые таблицы и индексы.
+    Повторный запуск безопасен.
+    """
+
+    conn = get_db()
+
+    try:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS groups (
+                chat_id BIGINT PRIMARY KEY,
+                title TEXT,
+                enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                hold_minutes INTEGER NOT NULL DEFAULT 10
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qr_messages (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                username TEXT,
+                display_name TEXT,
+                qr_data TEXT,
+                sent_at TIMESTAMPTZ NOT NULL,
+                counted BOOLEAN NOT NULL DEFAULT FALSE
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_cache (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_qr_chat_user_counted
+            ON qr_messages (
+                chat_id,
+                user_id,
+                counted,
+                id DESC
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_qr_chat
+            ON qr_messages (chat_id)
+            """
+        )
+
+        conn.commit()
+
+        logging.info(
+            "PostgreSQL database initialized successfully."
+        )
+
+    except Exception:
+        conn.rollback()
+        logging.exception(
+            "Ошибка инициализации PostgreSQL."
+        )
+        raise
+
+    finally:
+        conn.close()
+
+# =========================================================
+# RENDER HEALTH SERVER
+# =========================================================
+
 class HealthHandler(BaseHTTPRequestHandler):
+
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8",
+        )
         self.end_headers()
         self.wfile.write(b"OK")
 
@@ -67,155 +182,124 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_render_health_server():
     port = int(os.environ.get("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logging.info("Render health server started on port %s", port)
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler,
+    )
+
+    logging.info(
+        "Render health server started on port %s",
+        port,
+    )
+
     server.serve_forever()
 
 
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS groups (
-            chat_id INTEGER PRIMARY KEY,
-            title TEXT,
-            enabled INTEGER NOT NULL DEFAULT 0,
-            hold_minutes INTEGER NOT NULL DEFAULT 10
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS qr_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            display_name TEXT,
-            sent_at TEXT NOT NULL,
-            counted INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT NOT NULL UNIQUE
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_cache (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT
-        )
-    """)
-
-    # Для старой базы данных:
-    try:
-        cursor.execute(
-            "ALTER TABLE groups ADD COLUMN title TEXT"
-        )
-    except sqlite3.OperationalError:
-        pass
-
-    conn.commit()
-    conn.close()
-
+# =========================================================
+# GROUPS
+# =========================================================
 
 def ensure_group(chat_id: int, title: str = None):
+
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        INSERT OR IGNORE INTO groups
-        (chat_id, title, enabled, hold_minutes)
-        VALUES (?, ?, 0, 10)
-        """,
-        (chat_id, title),
-    )
+    try:
+        cursor = conn.cursor()
 
-    if title:
         cursor.execute(
             """
-            UPDATE groups
-            SET title = ?
-            WHERE chat_id = ?
+            INSERT INTO groups
+                (chat_id, title, enabled, hold_minutes)
+            VALUES
+                (%s, %s, 0, 10)
+            ON CONFLICT (chat_id)
+            DO NOTHING
             """,
-            (title, chat_id),
+            (
+                chat_id,
+                title,
+            ),
         )
 
-    conn.commit()
-    conn.close()
+        if title:
+            cursor.execute(
+                """
+                UPDATE groups
+                SET title = %s
+                WHERE chat_id = %s
+                """,
+                (
+                    title,
+                    chat_id,
+                ),
+            )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        logging.exception("Ошибка ensure_group")
+
+    finally:
+        conn.close()
 
 
 def get_group_settings(chat_id: int):
+
     ensure_group(chat_id)
 
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        SELECT *
-        FROM groups
-        WHERE chat_id = ?
-        """,
-        (chat_id,),
-    )
-
-    row = cursor.fetchone()
-    conn.close()
-
-    return row
-
-
-async def safe_edit_message(
-    query,
-    text,
-    reply_markup=None,
-):
     try:
-        await query.edit_message_text(
-            text=text,
-            parse_mode="HTML",
-            reply_markup=reply_markup,
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM groups
+            WHERE chat_id = %s
+            """,
+            (chat_id,),
         )
-    except BadRequest as error:
-        if "Message is not modified" not in str(error):
-            raise
+
+        return cursor.fetchone()
+
+    finally:
+        conn.close()
 
 
 def get_all_groups():
+
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        SELECT *
-        FROM groups
-        ORDER BY title
-        """
-    )
+    try:
+        cursor = conn.cursor()
 
-    rows = cursor.fetchall()
-    conn.close()
+        cursor.execute(
+            """
+            SELECT *
+            FROM groups
+            ORDER BY title
+            """
+        )
 
-    return rows
+        return cursor.fetchall()
 
+    finally:
+        conn.close()
+
+
+# =========================================================
+# ADMIN
+# =========================================================
 
 def normalize_username(username: str) -> str:
     return username.strip().lstrip("@").lower()
 
 
 def is_admin(update: Update) -> bool:
+
     user = update.effective_user
 
     if not user:
@@ -231,24 +315,29 @@ def is_admin(update: Update) -> bool:
         return True
 
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        SELECT user_id
-        FROM admins
-        WHERE user_id = ?
-        """,
-        (user.id,),
-    )
+    try:
+        cursor = conn.cursor()
 
-    row = cursor.fetchone()
-    conn.close()
+        cursor.execute(
+            """
+            SELECT user_id
+            FROM admins
+            WHERE user_id = %s
+            """,
+            (user.id,),
+        )
 
-    return row is not None
+        row = cursor.fetchone()
+
+        return row is not None
+
+    finally:
+        conn.close()
 
 
 def register_owner(update: Update):
+
     user = update.effective_user
 
     if not user or not user.username:
@@ -260,110 +349,169 @@ def register_owner(update: Update):
         return
 
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO admins
-        (user_id, username)
-        VALUES (?, ?)
-        """,
-        (
-            user.id,
-            normalize_username(user.username),
-        ),
-    )
+    try:
+        cursor = conn.cursor()
 
-    conn.commit()
-    conn.close()
+        cursor.execute(
+            """
+            INSERT INTO admins
+                (user_id, username)
+            VALUES
+                (%s, %s)
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                username = EXCLUDED.username
+            """,
+            (
+                user.id,
+                normalize_username(user.username),
+            ),
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        logging.exception("Ошибка register_owner")
+
+    finally:
+        conn.close()
 
 
 def get_admins():
+
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        SELECT user_id, username
-        FROM admins
-        ORDER BY username
-        """
-    )
+    try:
+        cursor = conn.cursor()
 
-    rows = cursor.fetchall()
-    conn.close()
+        cursor.execute(
+            """
+            SELECT user_id, username
+            FROM admins
+            ORDER BY username
+            """
+        )
 
-    return rows
+        return cursor.fetchall()
+
+    finally:
+        conn.close()
 
 
 def add_admin(user_id: int, username: str):
+
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO admins
-        (user_id, username)
-        VALUES (?, ?)
-        """,
-        (
-            user_id,
-            normalize_username(username),
-        ),
-    )
+    try:
+        cursor = conn.cursor()
 
-    conn.commit()
-    conn.close()
+        cursor.execute(
+            """
+            INSERT INTO admins
+                (user_id, username)
+            VALUES
+                (%s, %s)
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                username = EXCLUDED.username
+            """,
+            (
+                user_id,
+                normalize_username(username),
+            ),
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        logging.exception("Ошибка add_admin")
+
+    finally:
+        conn.close()
 
 
 def remove_admin(user_id: int):
+
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        DELETE FROM admins
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    )
+    try:
+        cursor = conn.cursor()
 
-    conn.commit()
-    conn.close()
+        cursor.execute(
+            """
+            DELETE FROM admins
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
 
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        logging.exception("Ошибка remove_admin")
+
+    finally:
+        conn.close()
+
+
+# =========================================================
+# USER CACHE
+# =========================================================
 
 async def cache_user(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     user = update.effective_user
 
     if not user or not user.username:
         return
 
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO user_cache
-        (user_id, username)
-        VALUES (?, ?)
-        """,
-        (
-            user.id,
-            normalize_username(user.username),
-        ),
-    )
+    try:
+        cursor = conn.cursor()
 
-    conn.commit()
-    conn.close()
+        cursor.execute(
+            """
+            INSERT INTO user_cache
+                (user_id, username)
+            VALUES
+                (%s, %s)
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                username = EXCLUDED.username
+            """,
+            (
+                user.id,
+                normalize_username(user.username),
+            ),
+        )
 
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        logging.exception("Ошибка cache_user")
+
+    finally:
+        conn.close()
+
+
+# =========================================================
+# REGISTER GROUP
+# =========================================================
 
 async def register_group(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     chat = update.effective_chat
 
     if not chat:
@@ -380,79 +528,102 @@ async def register_group(
     )
 
 
+# =========================================================
+# STATISTICS
+# =========================================================
+
 def get_group_statistics(chat_id: int):
+
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        SELECT
-            user_id,
-            username,
-            display_name,
-            COUNT(*) AS total
-        FROM qr_messages
-        WHERE chat_id = ?
-          AND counted = 1
-        GROUP BY user_id
-        ORDER BY total DESC
-        """,
-        (chat_id,),
-    )
+    try:
+        cursor = conn.cursor()
 
-    users = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT
+                user_id,
+                username,
+                display_name,
+                COUNT(*) AS total
+            FROM qr_messages
+            WHERE chat_id = %s
+              AND counted = 1
+            GROUP BY
+                user_id,
+                username,
+                display_name
+            ORDER BY total DESC
+            """,
+            (chat_id,),
+        )
 
-    cursor.execute(
-        """
-        SELECT COUNT(*) AS total
-        FROM qr_messages
-        WHERE chat_id = ?
-        """,
-        (chat_id,),
-    )
+        users = cursor.fetchall()
 
-    total_all = cursor.fetchone()["total"]
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM qr_messages
+            WHERE chat_id = %s
+            """,
+            (chat_id,),
+        )
 
-    cursor.execute(
-        """
-        SELECT COUNT(*) AS total
-        FROM qr_messages
-        WHERE chat_id = ?
-          AND counted = 1
-        """,
-        (chat_id,),
-    )
+        total_all = cursor.fetchone()["total"]
 
-    total_counted = cursor.fetchone()["total"]
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM qr_messages
+            WHERE chat_id = %s
+              AND counted = 1
+            """,
+            (chat_id,),
+        )
 
-    cursor.execute(
-        """
-        SELECT COUNT(DISTINCT user_id) AS total
-        FROM qr_messages
-        WHERE chat_id = ?
-        """,
-        (chat_id,),
-    )
+        total_counted = cursor.fetchone()["total"]
 
-    users_count = cursor.fetchone()["total"]
+        cursor.execute(
+            """
+            SELECT COUNT(DISTINCT user_id) AS total
+            FROM qr_messages
+            WHERE chat_id = %s
+            """,
+            (chat_id,),
+        )
 
-    conn.close()
+        users_count = cursor.fetchone()["total"]
 
-    return (
-        users,
-        total_all,
-        total_counted,
-        users_count,
-    )
+        return (
+            users,
+            total_all,
+            total_counted,
+            users_count,
+        )
 
+    finally:
+        conn.close()
+
+
+# =========================================================
+# MENUS
+# =========================================================
 
 def groups_menu():
+
     groups = get_all_groups()
+
     keyboard = []
 
     for group in groups:
+
         title = group["title"] or "Без названия"
-        status = "🟢" if group["enabled"] else "🔴"
+
+        status = (
+            "🟢"
+            if group["enabled"]
+            else "🔴"
+        )
 
         keyboard.append(
             [
@@ -485,6 +656,7 @@ def groups_menu():
 
 
 def group_menu(chat_id: int):
+
     keyboard = [
         [
             InlineKeyboardButton(
@@ -538,6 +710,7 @@ def group_menu(chat_id: int):
 
 
 def admins_menu():
+
     keyboard = [
         [
             InlineKeyboardButton(
@@ -569,23 +742,31 @@ def admins_menu():
 
 
 def admin_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "👥 Группы",
-                callback_data="groups",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "👥 Администраторы",
-                callback_data="admins",
-            )
-        ],
-    ])
 
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "👥 Группы",
+                    callback_data="groups",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "👥 Администраторы",
+                    callback_data="admins",
+                )
+            ],
+        ]
+    )
+
+
+# =========================================================
+# TEXT
+# =========================================================
 
 def make_group_overview(chat_id: int):
+
     row = get_group_settings(chat_id)
 
     title = row["title"] or "Без названия"
@@ -596,9 +777,12 @@ def make_group_overview(chat_id: int):
         else "🔴 Выключено"
     )
 
-    users, total_all, total_counted, users_count = (
-        get_group_statistics(chat_id)
-    )
+    (
+        users,
+        total_all,
+        total_counted,
+        users_count,
+    ) = get_group_statistics(chat_id)
 
     return (
         f"📱 <b>{title}</b>\n\n"
@@ -613,24 +797,29 @@ def make_group_overview(chat_id: int):
 
 
 def make_stats_text(chat_id: int):
+
     row = get_group_settings(chat_id)
 
     title = row["title"] or "Без названия"
 
-    users, total_all, total_counted, users_count = (
-        get_group_statistics(chat_id)
-    )
+    (
+        users,
+        total_all,
+        total_counted,
+        users_count,
+    ) = get_group_statistics(chat_id)
 
     text = (
-        f"📊 <b>Статистика</b>\n"
+        "📊 <b>Статистика</b>\n"
         f"📱 {title}\n\n"
     )
 
     if not users:
-        text += "Пока нет отправленных QR.\n"
+        text += "Пока нет отправленных QR."
         return text
 
     for index, user in enumerate(users, start=1):
+
         if user["username"]:
             name = f"@{user['username']}"
         else:
@@ -652,27 +841,61 @@ def make_stats_text(chat_id: int):
     return text
 
 
+# =========================================================
+# SAFE EDIT
+# =========================================================
+
+async def safe_edit_message(
+    query,
+    text,
+    reply_markup=None,
+):
+
+    try:
+
+        await query.edit_message_text(
+            text=text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+
+    except BadRequest as error:
+
+        if "Message is not modified" not in str(error):
+            raise
+
+
+# =========================================================
+# /START
+# =========================================================
+
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     register_owner(update)
 
     if update.effective_chat.type != "private":
+
         await update.message.reply_text(
             "Используйте команды в группе."
         )
+
         return
 
     if not is_admin(update):
+
         await update.message.reply_text(
             "❌ У вас нет доступа к панели администратора."
         )
+
         return
 
     groups = get_all_groups()
 
     if not groups:
+
         await update.message.reply_text(
             "🔧 <b>Панель администратора</b>\n\n"
             "Бот пока не обнаружил ни одной группы.\n\n"
@@ -680,6 +903,7 @@ async def start(
             "любое сообщение.",
             parse_mode="HTML",
         )
+
         return
 
     await update.message.reply_text(
@@ -690,32 +914,46 @@ async def start(
     )
 
 
+# =========================================================
+# ADMIN CALLBACKS
+# =========================================================
+
 async def admin_panel(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     query = update.callback_query
 
     await query.answer()
 
     if not is_admin(update):
+
         await safe_edit_message(
             query,
             "❌ У вас больше нет доступа.",
         )
+
         return
 
     data = query.data
 
+    # -----------------------------------------------------
+    # GROUPS
+    # -----------------------------------------------------
+
     if data == "groups":
+
         groups = get_all_groups()
 
         if not groups:
+
             await safe_edit_message(
                 query,
                 "📭 Групп пока нет.",
                 admin_menu(),
             )
+
             return
 
         await safe_edit_message(
@@ -724,38 +962,63 @@ async def admin_panel(
             "Выберите группу:",
             groups_menu(),
         )
+
         return
 
+    # -----------------------------------------------------
+    # GROUP
+    # -----------------------------------------------------
+
     if data.startswith("group:"):
-        chat_id = int(data.split(":", 1)[1])
+
+        chat_id = int(
+            data.split(":", 1)[1]
+        )
 
         await safe_edit_message(
             query,
             make_group_overview(chat_id),
             group_menu(chat_id),
         )
+
         return
 
+    # -----------------------------------------------------
+    # STATS
+    # -----------------------------------------------------
+
     if data.startswith("stats:"):
-        chat_id = int(data.split(":", 1)[1])
+
+        chat_id = int(
+            data.split(":", 1)[1]
+        )
 
         await safe_edit_message(
             query,
             make_stats_text(chat_id),
             group_menu(chat_id),
         )
+
         return
 
+    # -----------------------------------------------------
+    # SETTINGS
+    # -----------------------------------------------------
+
     if data.startswith("settings:"):
-        chat_id = int(data.split(":", 1)[1])
-        settings = get_group_settings(chat_id)
+
+        chat_id = int(
+            data.split(":", 1)[1]
+        )
+
+        settings_row = get_group_settings(chat_id)
 
         text = (
             "⚙️ <b>Настройки группы</b>\n\n"
-            f"Название: <b>{settings['title']}</b>\n"
+            f"Название: <b>{settings_row['title']}</b>\n"
             f"Статус: "
-            f"{'🟢 Включена' if settings['enabled'] else '🔴 Выключена'}\n"
-            f"Hold: <b>{settings['hold_minutes']} мин.</b>"
+            f"{'🟢 Включена' if settings_row['enabled'] else '🔴 Выключена'}\n"
+            f"Hold: <b>{settings_row['hold_minutes']} мин.</b>"
         )
 
         await safe_edit_message(
@@ -763,43 +1026,66 @@ async def admin_panel(
             text,
             group_menu(chat_id),
         )
+
         return
 
+    # -----------------------------------------------------
+    # ENABLE
+    # -----------------------------------------------------
+
     if data.startswith("enable:"):
-        chat_id = int(data.split(":", 1)[1])
 
-        conn = get_db()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            UPDATE groups
-            SET enabled = 1
-            WHERE chat_id = ?
-            """,
-            (chat_id,),
+        chat_id = int(
+            data.split(":", 1)[1]
         )
 
-        conn.commit()
-        conn.close()
+        conn = get_db()
+
+        try:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                UPDATE groups
+                SET enabled = 1
+                WHERE chat_id = %s
+                """,
+                (chat_id,),
+            )
+
+            conn.commit()
+
+        finally:
+            conn.close()
 
         await safe_edit_message(
             query,
             make_group_overview(chat_id),
             group_menu(chat_id),
         )
+
         return
 
+    # -----------------------------------------------------
+    # DISABLE
+    # -----------------------------------------------------
+
     if data.startswith("disable:"):
-        chat_id = int(data.split(":", 1)[1])
+
+        chat_id = int(
+            data.split(":", 1)[1]
+        )
 
         try:
+
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=TECHNICAL_BREAK_TEXT,
                 parse_mode="HTML",
             )
+
         except Exception as error:
+
             logging.warning(
                 "Не удалось отправить сообщение "
                 "о техническом перерыве: %s",
@@ -807,35 +1093,49 @@ async def admin_panel(
             )
 
         conn = get_db()
-        cursor = conn.cursor()
 
-        cursor.execute(
-            """
-            UPDATE groups
-            SET enabled = 0
-            WHERE chat_id = ?
-            """,
-            (chat_id,),
-        )
+        try:
 
-        conn.commit()
-        conn.close()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                UPDATE groups
+                SET enabled = 0
+                WHERE chat_id = %s
+                """,
+                (chat_id,),
+            )
+
+            conn.commit()
+
+        finally:
+            conn.close()
 
         await safe_edit_message(
             query,
             make_group_overview(chat_id),
             group_menu(chat_id),
         )
+
         return
 
+    # -----------------------------------------------------
+    # HOLD MENU
+    # -----------------------------------------------------
+
     if data.startswith("hold:"):
-        chat_id = int(data.split(":", 1)[1])
-        settings = get_group_settings(chat_id)
+
+        chat_id = int(
+            data.split(":", 1)[1]
+        )
+
+        settings_row = get_group_settings(chat_id)
 
         text = (
             "⏱ <b>Настройка Hold</b>\n\n"
             f"Текущий hold: "
-            f"<b>{settings['hold_minutes']} мин.</b>\n\n"
+            f"<b>{settings_row['hold_minutes']} мин.</b>\n\n"
             "Выберите новое значение:"
         )
 
@@ -873,38 +1173,63 @@ async def admin_panel(
             text,
             InlineKeyboardMarkup(keyboard),
         )
+
         return
 
+    # -----------------------------------------------------
+    # SET HOLD
+    # -----------------------------------------------------
+
     if data.startswith("sethold:"):
-        _, chat_id_text, minutes_text = data.split(":", 2)
+
+        _, chat_id_text, minutes_text = data.split(
+            ":",
+            2,
+        )
 
         chat_id = int(chat_id_text)
         minutes = int(minutes_text)
 
         conn = get_db()
-        cursor = conn.cursor()
 
-        cursor.execute(
-            """
-            UPDATE groups
-            SET hold_minutes = ?
-            WHERE chat_id = ?
-            """,
-            (minutes, chat_id),
-        )
+        try:
 
-        conn.commit()
-        conn.close()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                UPDATE groups
+                SET hold_minutes = %s
+                WHERE chat_id = %s
+                """,
+                (
+                    minutes,
+                    chat_id,
+                ),
+            )
+
+            conn.commit()
+
+        finally:
+            conn.close()
 
         await safe_edit_message(
             query,
             make_group_overview(chat_id),
             group_menu(chat_id),
         )
+
         return
 
+    # -----------------------------------------------------
+    # CLEAR
+    # -----------------------------------------------------
+
     if data.startswith("clear:"):
-        chat_id = int(data.split(":", 1)[1])
+
+        chat_id = int(
+            data.split(":", 1)[1]
+        )
 
         keyboard = [
             [
@@ -926,24 +1251,37 @@ async def admin_panel(
             "будут удалены.",
             InlineKeyboardMarkup(keyboard),
         )
+
         return
 
+    # -----------------------------------------------------
+    # CONFIRM CLEAR
+    # -----------------------------------------------------
+
     if data.startswith("confirm_clear:"):
-        chat_id = int(data.split(":", 1)[1])
 
-        conn = get_db()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            DELETE FROM qr_messages
-            WHERE chat_id = ?
-            """,
-            (chat_id,),
+        chat_id = int(
+            data.split(":", 1)[1]
         )
 
-        conn.commit()
-        conn.close()
+        conn = get_db()
+
+        try:
+
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                DELETE FROM qr_messages
+                WHERE chat_id = %s
+                """,
+                (chat_id,),
+            )
+
+            conn.commit()
+
+        finally:
+            conn.close()
 
         await safe_edit_message(
             query,
@@ -951,61 +1289,86 @@ async def admin_panel(
             "Все QR-события этой группы удалены.",
             group_menu(chat_id),
         )
+
         return
 
+    # -----------------------------------------------------
+    # ADMINS
+    # -----------------------------------------------------
+
     if data == "admins":
+
         await safe_edit_message(
             query,
             "👑 <b>Администраторы</b>\n\n"
             "Выберите действие:",
-            InlineKeyboardMarkup([
+            InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton(
-                        "👥 Список",
-                        callback_data="admins_list",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "➕ Добавить",
-                        callback_data="add_admin",
-                    ),
-                    InlineKeyboardButton(
-                        "➖ Удалить",
-                        callback_data="remove_admin",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Назад",
-                        callback_data="admin",
-                    )
-                ],
-            ]),
+                    [
+                        InlineKeyboardButton(
+                            "👥 Список",
+                            callback_data="admins_list",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "➕ Добавить",
+                            callback_data="add_admin",
+                        ),
+                        InlineKeyboardButton(
+                            "➖ Удалить",
+                            callback_data="remove_admin",
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Назад",
+                            callback_data="groups",
+                        )
+                    ],
+                ]
+            ),
         )
+
         return
 
+    # -----------------------------------------------------
+    # ADMIN LIST
+    # -----------------------------------------------------
+
     if data == "admins_list":
+
         conn = get_db()
-        cursor = conn.cursor()
 
-        cursor.execute(
-            """
-            SELECT username
-            FROM admins
-            ORDER BY username
-            """
-        )
+        try:
 
-        admins = cursor.fetchall()
-        conn.close()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT username
+                FROM admins
+                ORDER BY username
+                """
+            )
+
+            admins = cursor.fetchall()
+
+        finally:
+            conn.close()
 
         if admins:
+
             text = "👑 <b>Администраторы</b>\n\n"
 
             for admin in admins:
-                text += f"• @{admin['username']}\n"
+
+                text += (
+                    f"• @{admin['username']}\n"
+                )
+
         else:
+
             text = (
                 "👑 <b>Администраторы</b>\n\n"
                 "Список пуст."
@@ -1025,9 +1388,15 @@ async def admin_panel(
             text,
             InlineKeyboardMarkup(keyboard),
         )
+
         return
 
+    # -----------------------------------------------------
+    # ADD ADMIN
+    # -----------------------------------------------------
+
     if data == "add_admin":
+
         context.user_data["admin_action"] = "add"
         context.user_data["waiting_for_admin"] = True
 
@@ -1037,65 +1406,87 @@ async def admin_panel(
             "Отправьте username пользователя "
             "в формате:\n\n"
             "<code>@username</code>",
-            InlineKeyboardMarkup([
+            InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton(
-                        "⬅️ Назад",
-                        callback_data="admins",
-                    )
-                ]
-            ]),
-        )
-        return
-
-    if data == "remove_admin":
-        conn = get_db()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            SELECT username
-            FROM admins
-            ORDER BY username
-            """
-        )
-
-        admins = cursor.fetchall()
-        conn.close()
-
-        if not admins:
-            await safe_edit_message(
-                query,
-                "❌ Администраторов нет.",
-                InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton(
                             "⬅️ Назад",
                             callback_data="admins",
                         )
                     ]
-                ]),
+                ]
+            ),
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # REMOVE ADMIN
+    # -----------------------------------------------------
+
+    if data == "remove_admin":
+
+        conn = get_db()
+
+        try:
+
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT username
+                FROM admins
+                ORDER BY username
+                """
             )
+
+            admins = cursor.fetchall()
+
+        finally:
+            conn.close()
+
+        if not admins:
+
+            await safe_edit_message(
+                query,
+                "❌ Администраторов нет.",
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад",
+                                callback_data="admins",
+                            )
+                        ]
+                    ]
+                ),
+            )
+
             return
 
         keyboard = []
 
         for admin in admins:
+
             username = admin["username"]
 
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"❌ @{username}",
-                    callback_data=f"remove:{username}",
-                )
-            ])
-
-        keyboard.append([
-            InlineKeyboardButton(
-                "⬅️ Назад",
-                callback_data="admins",
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"❌ @{username}",
+                        callback_data=f"remove:{username}",
+                    )
+                ]
             )
-        ])
+
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data="admins",
+                )
+            ]
+        )
 
         await safe_edit_message(
             query,
@@ -1103,53 +1494,78 @@ async def admin_panel(
             "Выберите администратора:",
             InlineKeyboardMarkup(keyboard),
         )
+
         return
 
+    # -----------------------------------------------------
+    # REMOVE ADMIN
+    # -----------------------------------------------------
+
     if data.startswith("remove:"):
+
         username = data.split(":", 1)[1]
 
         conn = get_db()
-        cursor = conn.cursor()
 
-        cursor.execute(
-            """
-            DELETE FROM admins
-            WHERE username = ?
-            """,
-            (username,),
-        )
+        try:
 
-        conn.commit()
-        conn.close()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                DELETE FROM admins
+                WHERE username = %s
+                """,
+                (username,),
+            )
+
+            conn.commit()
+
+        finally:
+            conn.close()
 
         await safe_edit_message(
             query,
             f"✅ Администратор @{username} удалён.",
-            InlineKeyboardMarkup([
+            InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton(
-                        "⬅️ К администраторам",
-                        callback_data="admins",
-                    )
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ К администраторам",
+                            callback_data="admins",
+                        )
+                    ]
                 ]
-            ]),
+            ),
         )
+
         return
 
+    # -----------------------------------------------------
+    # ADMIN
+    # -----------------------------------------------------
+
     if data == "admin":
+
         await safe_edit_message(
             query,
             "⚙️ <b>Панель администратора</b>\n\n"
             "Выберите раздел:",
             admin_menu(),
         )
+
         return
 
+
+# =========================================================
+# ADMIN INPUT
+# =========================================================
 
 async def handle_admin_input(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not update.message:
         return
 
@@ -1161,82 +1577,121 @@ async def handle_admin_input(
 
     text = update.message.text.strip()
 
+    # -----------------------------------------------------
+    # HOLD
+    # -----------------------------------------------------
+
     if "waiting_hold" in context.user_data:
+
         chat_id = context.user_data["waiting_hold"]
 
         try:
             minutes = int(text)
+
         except ValueError:
+
             await update.message.reply_text(
                 "❌ Введите целое число минут."
             )
+
             return
 
         if minutes < 0 or minutes > 1440:
+
             await update.message.reply_text(
                 "❌ Hold должен быть от 0 до 1440 минут."
             )
+
             return
 
         conn = get_db()
-        cursor = conn.cursor()
 
-        cursor.execute(
-            """
-            UPDATE groups
-            SET hold_minutes = ?
-            WHERE chat_id = ?
-            """,
-            (minutes, chat_id),
-        )
+        try:
 
-        conn.commit()
-        conn.close()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                UPDATE groups
+                SET hold_minutes = %s
+                WHERE chat_id = %s
+                """,
+                (
+                    minutes,
+                    chat_id,
+                ),
+            )
+
+            conn.commit()
+
+        finally:
+            conn.close()
 
         del context.user_data["waiting_hold"]
 
         await update.message.reply_text(
-            f"✅ Hold установлен: <b>{minutes} минут</b>.",
+            f"✅ Hold установлен: "
+            f"<b>{minutes} минут</b>.",
             parse_mode="HTML",
             reply_markup=group_menu(chat_id),
         )
+
         return
 
+    # -----------------------------------------------------
+    # ADD ADMIN
+    # -----------------------------------------------------
+
     if context.user_data.get("waiting_for_admin"):
+
         username = normalize_username(text)
 
         if not username:
+
             await update.message.reply_text(
                 "❌ Неверный username."
             )
+
             return
 
-        owner = normalize_username(OWNER_USERNAME)
+        owner = normalize_username(
+            OWNER_USERNAME
+        )
 
         if username == owner:
+
             await update.message.reply_text(
                 "ℹ️ Это главный администратор."
             )
 
-            context.user_data["waiting_for_admin"] = False
+            context.user_data[
+                "waiting_for_admin"
+            ] = False
+
             return
 
         conn = get_db()
-        cursor = conn.cursor()
 
-        cursor.execute(
-            """
-            SELECT user_id
-            FROM user_cache
-            WHERE username = ?
-            """,
-            (username,),
-        )
+        try:
 
-        row = cursor.fetchone()
-        conn.close()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT user_id
+                FROM user_cache
+                WHERE username = %s
+                """,
+                (username,),
+            )
+
+            row = cursor.fetchone()
+
+        finally:
+            conn.close()
 
         if row is None:
+
             await update.message.reply_text(
                 "❌ Я не знаю Telegram ID этого пользователя.\n\n"
                 f"Пусть @{username} сначала отправит "
@@ -1244,7 +1699,10 @@ async def handle_admin_input(
                 "После этого добавьте его ещё раз."
             )
 
-            context.user_data["waiting_for_admin"] = False
+            context.user_data[
+                "waiting_for_admin"
+            ] = False
+
             return
 
         add_admin(
@@ -1252,7 +1710,9 @@ async def handle_admin_input(
             username,
         )
 
-        context.user_data["waiting_for_admin"] = False
+        context.user_data[
+            "waiting_for_admin"
+        ] = False
 
         await update.message.reply_text(
             f"✅ <b>@{username}</b> добавлен "
@@ -1261,73 +1721,128 @@ async def handle_admin_input(
             reply_markup=admins_menu(),
         )
 
+
+# =========================================================
+# QR DETECTION
+# =========================================================
+
 def contains_qr(image_bytes):
+
     try:
-        image_array = np.frombuffer(image_bytes, dtype=np.uint8)
-        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+        image_array = np.frombuffer(
+            image_bytes,
+            dtype=np.uint8,
+        )
+
+        image = cv2.imdecode(
+            image_array,
+            cv2.IMREAD_COLOR,
+        )
 
         if image is None:
-            logging.warning("Не удалось открыть изображение")
+
+            logging.warning(
+                "Не удалось открыть изображение"
+            )
+
             return False
 
         detector = cv2.QRCodeDetector()
 
-        # 1. Оригинальное изображение
+        # 1. Original image
+
         try:
+
             ok, points = detector.detect(image)
 
             if ok and points is not None:
-                logging.info("QR-код обнаружен")
-                return True
-        except Exception as error:
-            logging.warning("Ошибка detect(): %s", error)
 
-        # 2. Увеличиваем изображение
+                logging.info(
+                    "QR-код обнаружен"
+                )
+
+                return True
+
+        except Exception as error:
+
+            logging.warning(
+                "Ошибка detect(): %s",
+                error,
+            )
+
+        # 2. Enlarged
+
         height, width = image.shape[:2]
 
         scale = 2
 
         enlarged = cv2.resize(
             image,
-            (width * scale, height * scale),
+            (
+                width * scale,
+                height * scale,
+            ),
             interpolation=cv2.INTER_CUBIC,
         )
 
         try:
-            ok, points = detector.detect(enlarged)
+
+            ok, points = detector.detect(
+                enlarged
+            )
 
             if ok and points is not None:
-                logging.info("QR-код обнаружен после увеличения")
+
+                logging.info(
+                    "QR-код обнаружен после увеличения"
+                )
+
                 return True
+
         except Exception as error:
+
             logging.warning(
                 "Ошибка detect() после увеличения: %s",
                 error,
             )
 
         # 3. Grayscale
+
         gray = cv2.cvtColor(
             enlarged,
             cv2.COLOR_BGR2GRAY,
         )
 
         try:
-            ok, points = detector.detect(gray)
+
+            ok, points = detector.detect(
+                gray
+            )
 
             if ok and points is not None:
-                logging.info("QR-код обнаружен на grayscale")
+
+                logging.info(
+                    "QR-код обнаружен на grayscale"
+                )
+
                 return True
+
         except Exception as error:
+
             logging.warning(
                 "Ошибка detect() grayscale: %s",
                 error,
             )
 
-        logging.info("QR-код не обнаружен")
+        logging.info(
+            "QR-код не обнаружен"
+        )
 
         return False
 
     except Exception as error:
+
         logging.exception(
             "Ошибка проверки изображения на QR: %s",
             error,
@@ -1336,18 +1851,15 @@ def contains_qr(image_bytes):
         return False
 
 
-
-
-
-
-
-
-        
+# =========================================================
+# PHOTO / QR
+# =========================================================
 
 async def handle_photo(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     message = update.message
 
     if not message:
@@ -1362,190 +1874,283 @@ async def handle_photo(
     if chat.type not in ("group", "supergroup"):
         return
 
-    settings_row = get_group_settings(chat.id)
+    settings_row = get_group_settings(
+        chat.id
+    )
 
     if not settings_row["enabled"]:
         return
 
     try:
+
         photo = message.photo[-1]
 
         telegram_file = await context.bot.get_file(
             photo.file_id
         )
 
-        image_bytes = await telegram_file.download_as_bytearray()
+        image_bytes = (
+            await telegram_file.download_as_bytearray()
+        )
 
     except Exception as error:
+
         logging.warning(
             "Не удалось скачать изображение: %s",
             error,
         )
+
         return
 
-    if not contains_qr(bytes(image_bytes)):
+    # Только QR
+    if not contains_qr(
+        bytes(image_bytes)
+    ):
+
         logging.info(
             "Обычная фотография, не QR: %s (%s)",
             user.full_name,
             user.id,
         )
+
         return
 
-    hold_minutes = settings_row["hold_minutes"]
+    hold_minutes = settings_row[
+        "hold_minutes"
+    ]
 
     now = datetime.now(timezone.utc)
 
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        SELECT sent_at
-        FROM qr_messages
-        WHERE chat_id = ?
-          AND user_id = ?
-          AND counted = 1
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (
-            chat.id,
-            user.id,
-        ),
-    )
+    try:
 
-    last_counted = cursor.fetchone()
+        cursor = conn.cursor()
 
-    counted = False
-
-    if last_counted is None:
-        counted = True
-    else:
-        last_time = datetime.fromisoformat(
-            last_counted["sent_at"]
+        # Последний засчитанный QR именно
+        # этого пользователя в этой группе.
+        cursor.execute(
+            """
+            SELECT sent_at
+            FROM qr_messages
+            WHERE chat_id = %s
+              AND user_id = %s
+              AND counted = 1
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (
+                chat.id,
+                user.id,
+            ),
         )
 
-        difference = (
-            now - last_time
-        ).total_seconds()
+        last_counted = cursor.fetchone()
 
-        if difference >= hold_minutes * 60:
+        counted = False
+
+        if last_counted is None:
+
             counted = True
 
-    username = user.username or ""
+        else:
 
-    display_name = (
-        user.full_name
-        or username
-        or str(user.id)
-    )
+            last_time = last_counted[
+                "sent_at"
+            ]
 
-    cursor.execute(
-        """
-        INSERT INTO qr_messages (
-            chat_id,
-            user_id,
-            username,
-            display_name,
-            sent_at,
-            counted
+            # PostgreSQL возвращает datetime
+            # с timezone.
+            if last_time.tzinfo is None:
+
+                last_time = last_time.replace(
+                    tzinfo=timezone.utc
+                )
+
+            difference = (
+                now - last_time
+            ).total_seconds()
+
+            if difference >= hold_minutes * 60:
+
+                counted = True
+
+        username = (
+            user.username or ""
         )
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            chat.id,
-            user.id,
-            username,
-            display_name,
-            now.isoformat(),
-            1 if counted else 0,
-        ),
-    )
 
-    conn.commit()
-    conn.close()
+        display_name = (
+            user.full_name
+            or username
+            or str(user.id)
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO qr_messages (
+                chat_id,
+                user_id,
+                username,
+                display_name,
+                sent_at,
+                counted
+            )
+            VALUES (
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
+            )
+            """,
+            (
+                chat.id,
+                user.id,
+                username,
+                display_name,
+                now,
+                1 if counted else 0,
+            ),
+        )
+
+        conn.commit()
+
+    except Exception:
+
+        conn.rollback()
+
+        logging.exception(
+            "Ошибка сохранения QR в PostgreSQL"
+        )
+
+    finally:
+
+        conn.close()
 
     logging.info(
         "%s QR: %s (%s)",
-        "COUNTED" if counted else "IGNORED/HOLD",
+        "COUNTED"
+        if counted
+        else "IGNORED/HOLD",
         display_name,
         user.id,
     )
 
 
+# =========================================================
+# ERROR HANDLER
+# =========================================================
+
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     logging.error(
         "Exception while handling update:",
         exc_info=context.error,
     )
 
 
+# =========================================================
+# /ON
+# =========================================================
+
 async def enable_bot(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     register_owner(update)
 
     if not is_admin(update):
+
         await update.message.reply_text(
             "❌ У вас нет прав администратора бота."
         )
+
         return
 
     chat = update.effective_chat
 
-    if chat.type not in ("group", "supergroup"):
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+
         await update.message.reply_text(
             "❌ Эту команду нужно использовать в группе."
         )
+
         return
 
-    ensure_group(chat.id, chat.title)
-
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        UPDATE groups
-        SET enabled = 1
-        WHERE chat_id = ?
-        """,
-        (chat.id,),
+    ensure_group(
+        chat.id,
+        chat.title,
     )
 
-    conn.commit()
-    conn.close()
+    conn = get_db()
+
+    try:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            UPDATE groups
+            SET enabled = 1
+            WHERE chat_id = %s
+            """,
+            (chat.id,),
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
 
     await update.message.reply_text(
         "🟢 Сканирование включено."
     )
 
 
+# =========================================================
+# /OFF
+# =========================================================
+
 async def disable_bot(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     register_owner(update)
 
     if not is_admin(update):
+
         await update.message.reply_text(
             "❌ У вас нет прав администратора бота."
         )
+
         return
 
     chat = update.effective_chat
 
-    if chat.type not in ("group", "supergroup"):
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+
         await update.message.reply_text(
             "❌ Эту команду нужно использовать в группе."
         )
+
         return
 
-    ensure_group(chat.id, chat.title)
+    ensure_group(
+        chat.id,
+        chat.title,
+    )
 
     await context.bot.send_message(
         chat_id=chat.id,
@@ -1554,106 +2159,161 @@ async def disable_bot(
     )
 
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        UPDATE groups
-        SET enabled = 0
-        WHERE chat_id = ?
-        """,
-        (chat.id,),
-    )
+    try:
 
-    conn.commit()
-    conn.close()
+        cursor = conn.cursor()
 
+        cursor.execute(
+            """
+            UPDATE groups
+            SET enabled = 0
+            WHERE chat_id = %s
+            """,
+            (chat.id,),
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+
+# =========================================================
+# /SETHOLD
+# =========================================================
 
 async def set_hold(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     register_owner(update)
 
     if not is_admin(update):
+
         await update.message.reply_text(
             "❌ У вас нет прав администратора бота."
         )
+
         return
 
     chat = update.effective_chat
 
-    if chat.type not in ("group", "supergroup"):
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+
         await update.message.reply_text(
             "❌ Эту команду нужно использовать в группе."
         )
+
         return
 
     if not context.args:
+
         await update.message.reply_text(
             "Использование:\n/sethold 10"
         )
+
         return
 
     try:
-        minutes = int(context.args[0])
+
+        minutes = int(
+            context.args[0]
+        )
+
     except ValueError:
+
         await update.message.reply_text(
             "❌ Укажи целое число минут."
         )
+
         return
 
     if minutes < 0 or minutes > 1440:
+
         await update.message.reply_text(
             "❌ Hold должен быть от 0 до 1440 минут."
         )
+
         return
 
-    ensure_group(chat.id, chat.title)
-
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        UPDATE groups
-        SET hold_minutes = ?
-        WHERE chat_id = ?
-        """,
-        (minutes, chat.id),
+    ensure_group(
+        chat.id,
+        chat.title,
     )
 
-    conn.commit()
-    conn.close()
+    conn = get_db()
+
+    try:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            UPDATE groups
+            SET hold_minutes = %s
+            WHERE chat_id = %s
+            """,
+            (
+                minutes,
+                chat.id,
+            ),
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
 
     await update.message.reply_text(
         f"⏱ Hold установлен: {minutes} минут."
     )
 
 
+# =========================================================
+# /SETTINGS
+# =========================================================
+
 async def settings(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     register_owner(update)
 
     if not is_admin(update):
+
         await update.message.reply_text(
             "❌ У вас нет прав администратора бота."
         )
+
         return
 
     chat = update.effective_chat
 
-    if chat.type not in ("group", "supergroup"):
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+
         await update.message.reply_text(
             "❌ Эту команду нужно использовать в группе."
         )
+
         return
 
-    ensure_group(chat.id, chat.title)
+    ensure_group(
+        chat.id,
+        chat.title,
+    )
 
-    row = get_group_settings(chat.id)
+    row = get_group_settings(
+        chat.id
+    )
 
     status = (
         "🟢 Включено"
@@ -1668,19 +2328,32 @@ async def settings(
     )
 
 
+# =========================================================
+# /STATS
+# =========================================================
+
 async def stats(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     chat = update.effective_chat
 
-    if chat.type not in ("group", "supergroup"):
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+
         await update.message.reply_text(
             "❌ Эту команду нужно использовать в группе."
         )
+
         return
 
-    ensure_group(chat.id, chat.title)
+    ensure_group(
+        chat.id,
+        chat.title,
+    )
 
     await update.message.reply_text(
         make_stats_text(chat.id),
@@ -1688,48 +2361,72 @@ async def stats(
     )
 
 
+# =========================================================
+# /CLEAR
+# =========================================================
+
 async def clear_stats(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     register_owner(update)
 
     if not is_admin(update):
+
         await update.message.reply_text(
             "❌ У вас нет прав администратора бота."
         )
+
         return
 
     chat = update.effective_chat
 
-    if chat.type not in ("group", "supergroup"):
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+
         await update.message.reply_text(
             "❌ Эту команду нужно использовать в группе."
         )
+
         return
 
     conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        DELETE FROM qr_messages
-        WHERE chat_id = ?
-        """,
-        (chat.id,),
-    )
+    try:
 
-    conn.commit()
-    conn.close()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            DELETE FROM qr_messages
+            WHERE chat_id = %s
+            """,
+            (chat.id,),
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
 
     await update.message.reply_text(
         "🗑 Статистика очищена."
     )
 
+
+# =========================================================
+# MAIN
+# =========================================================
+
 def main():
+
+    # Инициализация PostgreSQL
     init_db()
 
-    # Health server для Render
+    # Render health server
     threading.Thread(
         target=start_render_health_server,
         daemon=True,
@@ -1741,49 +2438,72 @@ def main():
         .build()
     )
 
-    # =========================
+    # =====================================================
     # COMMANDS
-    # =========================
+    # =====================================================
 
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start,
+        )
     )
 
     application.add_handler(
-        CommandHandler("on", enable_bot)
+        CommandHandler(
+            "on",
+            enable_bot,
+        )
     )
 
     application.add_handler(
-        CommandHandler("off", disable_bot)
+        CommandHandler(
+            "off",
+            disable_bot,
+        )
     )
 
     application.add_handler(
-        CommandHandler("sethold", set_hold)
+        CommandHandler(
+            "sethold",
+            set_hold,
+        )
     )
 
     application.add_handler(
-        CommandHandler("settings", settings)
+        CommandHandler(
+            "settings",
+            settings,
+        )
     )
 
     application.add_handler(
-        CommandHandler("stats", stats)
+        CommandHandler(
+            "stats",
+            stats,
+        )
     )
 
     application.add_handler(
-        CommandHandler("clear", clear_stats)
+        CommandHandler(
+            "clear",
+            clear_stats,
+        )
     )
 
-    # =========================
+    # =====================================================
     # ADMIN CALLBACKS
-    # =========================
+    # =====================================================
 
     application.add_handler(
-        CallbackQueryHandler(admin_panel)
+        CallbackQueryHandler(
+            admin_panel
+        )
     )
 
-    # =========================
+    # =====================================================
     # REGISTER GROUP
-    # =========================
+    # =====================================================
 
     application.add_handler(
         MessageHandler(
@@ -1793,9 +2513,9 @@ def main():
         group=5,
     )
 
-    # =========================
+    # =====================================================
     # CACHE USERS
-    # =========================
+    # =====================================================
 
     application.add_handler(
         MessageHandler(
@@ -1805,9 +2525,9 @@ def main():
         group=10,
     )
 
-    # =========================
+    # =====================================================
     # PRIVATE ADMIN INPUT
-    # =========================
+    # =====================================================
 
     application.add_handler(
         MessageHandler(
@@ -1817,9 +2537,9 @@ def main():
         group=1,
     )
 
-    # =========================
-    # QR / PHOTO HANDLER
-    # =========================
+    # =====================================================
+    # QR / PHOTO
+    # =====================================================
 
     application.add_handler(
         MessageHandler(
@@ -1829,9 +2549,9 @@ def main():
         group=0,
     )
 
-    # =========================
-    # ERROR HANDLER
-    # =========================
+    # =====================================================
+    # ERROR
+    # =====================================================
 
     application.add_error_handler(
         error_handler
@@ -1839,13 +2559,15 @@ def main():
 
     print("Bot started...")
 
-    # =========================
+    # =====================================================
     # START BOT
-    # =========================
+    # =====================================================
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
     )
 
+
 if __name__ == "__main__":
     main()
+

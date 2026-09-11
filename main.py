@@ -1262,40 +1262,6 @@ async def handle_admin_input(
         )
 
 
-async def delete_non_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    message = update.message
-
-    if not message:
-        return
-
-    chat = update.effective_chat
-
-    if not chat:
-        return
-
-    if chat.type not in ("group", "supergroup"):
-        return
-
-    # Фото считаются QR и не удаляются
-    if message.photo:
-        return
-
-    # Команды не удаляем
-    if message.text and message.text.startswith("/"):
-        return
-
-    try:
-        await message.delete()
-    except Exception as error:
-        logging.warning(
-            "Не удалось удалить сообщение: %s",
-            error,
-        )
-
-
 def contains_qr(image_bytes: bytes) -> bool:
     try:
         image_array = np.frombuffer(
@@ -1814,8 +1780,7 @@ def main():
         MessageHandler(
             filters.ALL
             & ~filters.COMMAND
-            & ~filters.PHOTO,
-            delete_non_command,
+            & ~filters.PHOTO
         ),
         group=20,
     )

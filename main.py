@@ -1673,11 +1673,10 @@ async def clear_stats(
         "🗑 Статистика очищена."
     )
 
-
 def main():
     init_db()
 
-    # Render Web Service: оставляем Telegram polling без изменения.
+    # Health server для Render
     threading.Thread(
         target=start_render_health_server,
         daemon=True,
@@ -1689,60 +1688,49 @@ def main():
         .build()
     )
 
+    # =========================
+    # COMMANDS
+    # =========================
+
     application.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
+        CommandHandler("start", start)
     )
 
     application.add_handler(
-        CommandHandler(
-            "on",
-            enable_bot,
-        )
+        CommandHandler("on", enable_bot)
     )
 
     application.add_handler(
-        CommandHandler(
-            "off",
-            disable_bot,
-        )
+        CommandHandler("off", disable_bot)
     )
 
     application.add_handler(
-        CommandHandler(
-            "sethold",
-            set_hold,
-        )
+        CommandHandler("sethold", set_hold)
     )
 
     application.add_handler(
-        CommandHandler(
-            "settings",
-            settings,
-        )
+        CommandHandler("settings", settings)
     )
 
     application.add_handler(
-        CommandHandler(
-            "stats",
-            stats,
-        )
+        CommandHandler("stats", stats)
     )
 
     application.add_handler(
-        CommandHandler(
-            "clear",
-            clear_stats,
-        )
+        CommandHandler("clear", clear_stats)
     )
 
+    # =========================
+    # ADMIN CALLBACKS
+    # =========================
+
     application.add_handler(
-        CallbackQueryHandler(
-            admin_panel
-        )
+        CallbackQueryHandler(admin_panel)
     )
+
+    # =========================
+    # REGISTER GROUP
+    # =========================
 
     application.add_handler(
         MessageHandler(
@@ -1752,6 +1740,10 @@ def main():
         group=5,
     )
 
+    # =========================
+    # CACHE USERS
+    # =========================
+
     application.add_handler(
         MessageHandler(
             filters.ALL,
@@ -1759,6 +1751,10 @@ def main():
         ),
         group=10,
     )
+
+    # =========================
+    # PRIVATE ADMIN INPUT
+    # =========================
 
     application.add_handler(
         MessageHandler(
@@ -1768,6 +1764,10 @@ def main():
         group=1,
     )
 
+    # =========================
+    # QR / PHOTO HANDLER
+    # =========================
+
     application.add_handler(
         MessageHandler(
             filters.PHOTO,
@@ -1776,14 +1776,9 @@ def main():
         group=0,
     )
 
-    application.add_handler(
-        MessageHandler(
-            filters.ALL
-            & ~filters.COMMAND
-            & ~filters.PHOTO
-        ),
-        group=20,
-    )
+    # =========================
+    # ERROR HANDLER
+    # =========================
 
     application.add_error_handler(
         error_handler
@@ -1791,10 +1786,13 @@ def main():
 
     print("Bot started...")
 
+    # =========================
+    # START BOT
+    # =========================
+
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
     )
-
-
+    
 if __name__ == "__main__":
     main()

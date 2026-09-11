@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: telegram-qr-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_USERNAME
+        sync: false
+      - key: DEFAULT_HOLD_MINUTES
+        value: "10"

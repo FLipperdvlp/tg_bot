@@ -1,0 +1,4 @@
+python-telegram-bot==22.5
+opencv-python-headless==4.12.0.88
+pyzbar==0.1.9
+numpy==2.2.6

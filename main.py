@@ -1261,105 +1261,88 @@ async def handle_admin_input(
             reply_markup=admins_menu(),
         )
 
-
 def contains_qr(image_bytes):
-    """
-    Проверяет, есть ли на изображении QR-код.
-    Использует pyzbar + OpenCV.
-    Возвращает True, если QR найден.
-    """
-
     try:
-        # Преобразуем bytes -> numpy -> OpenCV image
         image_array = np.frombuffer(image_bytes, dtype=np.uint8)
         image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
 
         if image is None:
-            logging.warning("Не удалось декодировать изображение")
+            logging.warning("Не удалось открыть изображение")
             return False
 
-        # ---------------------------------
-        # 1. Сначала пробуем pyzbar
-        # ---------------------------------
+        detector = cv2.QRCodeDetector()
 
+        # 1. Оригинальное изображение
         try:
-            decoded_objects = decode(image)
+            ok, points = detector.detect(image)
 
-            if decoded_objects:
-                for obj in decoded_objects:
-                    if obj.type == "QRCODE":
-                        logging.info(
-                            "QR найден через pyzbar: %s",
-                            obj.data.decode("utf-8", errors="ignore")
-                        )
-                        return True
-
-        except Exception as error:
-            logging.warning(
-                "Ошибка pyzbar: %s",
-                error
-            )
-
-        # ---------------------------------
-        # 2. Пробуем OpenCV
-        # ---------------------------------
-
-        try:
-            detector = cv2.QRCodeDetector()
-
-            data, points, _ = detector.detectAndDecode(image)
-
-            if points is not None:
-                logging.info(
-                    "QR найден через OpenCV: %s",
-                    data
-                )
+            if ok and points is not None:
+                logging.info("QR-код обнаружен")
                 return True
-
         except Exception as error:
-            logging.warning(
-                "Ошибка OpenCV QR detector: %s",
-                error
-            )
+            logging.warning("Ошибка detect(): %s", error)
 
-        # ---------------------------------
-        # 3. Пробуем grayscale
-        # ---------------------------------
+        # 2. Увеличиваем изображение
+        height, width = image.shape[:2]
+
+        scale = 2
+
+        enlarged = cv2.resize(
+            image,
+            (width * scale, height * scale),
+            interpolation=cv2.INTER_CUBIC,
+        )
 
         try:
-            gray = cv2.cvtColor(
-                image,
-                cv2.COLOR_BGR2GRAY
-            )
+            ok, points = detector.detect(enlarged)
 
-            decoded_objects = decode(gray)
-
-            if decoded_objects:
-                for obj in decoded_objects:
-                    if obj.type == "QRCODE":
-                        logging.info(
-                            "QR найден на grayscale через pyzbar"
-                        )
-                        return True
-
+            if ok and points is not None:
+                logging.info("QR-код обнаружен после увеличения")
+                return True
         except Exception as error:
             logging.warning(
-                "Ошибка grayscale QR: %s",
-                error
+                "Ошибка detect() после увеличения: %s",
+                error,
             )
 
-        logging.info("QR-код на изображении не найден")
+        # 3. Grayscale
+        gray = cv2.cvtColor(
+            enlarged,
+            cv2.COLOR_BGR2GRAY,
+        )
+
+        try:
+            ok, points = detector.detect(gray)
+
+            if ok and points is not None:
+                logging.info("QR-код обнаружен на grayscale")
+                return True
+        except Exception as error:
+            logging.warning(
+                "Ошибка detect() grayscale: %s",
+                error,
+            )
+
+        logging.info("QR-код не обнаружен")
 
         return False
 
     except Exception as error:
         logging.exception(
-            "Ошибка проверки QR: %s",
-            error
+            "Ошибка проверки изображения на QR: %s",
+            error,
         )
 
         return False
 
+
+
+
+
+
+
+
+        
 
 async def handle_photo(
     update: Update,

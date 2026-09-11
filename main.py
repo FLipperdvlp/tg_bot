@@ -1972,25 +1972,13 @@ async def handle_admin_input(
             reply_markup=admins_menu(),
         )
 
-
-# =========================================================
-# QR DECODER
-# =========================================================
-
-def decode_qr(
-    image_bytes: bytes,
-):
+def contains_qr(image_bytes: bytes) -> bool:
     """
-    Пытается реально расшифровать QR.
-
-    В отличие от detect(), эта функция
-    не считает просто найденный квадрат QR-кодом.
-
-    Возвращает содержимое QR либо None.
+    Проверяет только наличие QR-кода.
+    Содержимое QR не декодируется.
     """
 
     try:
-
         image_array = np.frombuffer(
             image_bytes,
             dtype=np.uint8,
@@ -2002,25 +1990,15 @@ def decode_qr(
         )
 
         if image is None:
-
-            logger.warning(
-                "Не удалось открыть изображение."
-            )
-
-            return None
+            return False
 
         detector = cv2.QRCodeDetector()
 
-        images_to_try = []
+        images_to_try = [image]
 
-        # 1. Оригинал
-        images_to_try.append(image)
-
-        # 2. Увеличенный
         height, width = image.shape[:2]
 
         if width > 0 and height > 0:
-
             enlarged = cv2.resize(
                 image,
                 (
@@ -2030,191 +2008,37 @@ def decode_qr(
                 interpolation=cv2.INTER_CUBIC,
             )
 
-            images_to_try.append(
-                enlarged
-            )
+            images_to_try.append(enlarged)
 
-            # 3. Grayscale
             gray = cv2.cvtColor(
                 enlarged,
                 cv2.COLOR_BGR2GRAY,
             )
 
-            images_to_try.append(
-                gray
-            )
-
-            # 4. Threshold
-            threshold = cv2.threshold(
-                gray,
-                0,
-                255,
-                cv2.THRESH_BINARY
-                + cv2.THRESH_OTSU,
-            )[1]
-
-            images_to_try.append(
-                threshold
-            )
-
-        # -------------------------------------------------
-        # SINGLE QR
-        # -------------------------------------------------
+            images_to_try.append(gray)
 
         for current_image in images_to_try:
 
             try:
-
-                data, points, _ = (
-                    detector.detectAndDecode(
-                        current_image
-                    )
+                found, points = detector.detect(
+                    current_image
                 )
 
-                if data and data.strip():
-
-                    decoded = data.strip()
-
-                    logger.info(
-                        "QR decoded: %s",
-                        decoded[:200],
-                    )
-
-                    return decoded
+                if found and points is not None:
+                    return True
 
             except Exception as error:
-
                 logger.debug(
-                    "detectAndDecode error: %s",
+                    "QR detect error: %s",
                     error,
                 )
 
-        # -------------------------------------------------
-        # MULTI QR
-        # -------------------------------------------------
-
-        for current_image in images_to_try:
-
-            try:
-
-                result = (
-                    detector.detectAndDecodeMulti(
-                        current_image
-                    )
-                )
-
-                if len(result) == 4:
-
-                    success, decoded_info, _, _ = (
-                        result
-                    )
-
-                    if success:
-
-                        for data in decoded_info:
-
-                            if (
-                                data
-                                and data.strip()
-                            ):
-
-                                decoded = (
-                                    data.strip()
-                                )
-
-                                logger.info(
-                                    "QR decoded "
-                                    "(multi): %s",
-                                    decoded[:200],
-                                )
-
-                                return decoded
-
-            except Exception as error:
-
-                logger.debug(
-                    "detectAndDecodeMulti "
-                    "error: %s",
-                    error,
-                )
-
-        logger.info(
-            "QR не удалось расшифровать."
-        )
-
-        return None
+        return False
 
     except Exception:
-
         logger.exception(
-            "Ошибка decode_qr"
+            "Ошибка contains_qr"
         )
-
-        return None
-
-
-# =========================================================
-# MAX.RU VALIDATION
-# =========================================================
-
-def is_max_ru_qr(
-    qr_data: str,
-) -> bool:
-    """
-    Проверяет, ведёт ли QR на max.ru.
-
-    Разрешены:
-        https://max.ru/...
-        http://max.ru/...
-        https://www.max.ru/...
-        https://web.max.ru/...
-
-    Не разрешаются, например:
-        https://max.ru.example.com
-        https://example.com/?url=max.ru
-    """
-
-    if not qr_data:
-        return False
-
-    value = qr_data.strip()
-
-    try:
-
-        # Если QR содержит max.ru/...
-        # без https://
-        if not value.startswith(
-            (
-                "http://",
-                "https://",
-            )
-        ):
-            value = (
-                "https://"
-                + value
-            )
-
-        parsed = urlparse(
-            value
-        )
-
-        hostname = (
-            parsed.hostname
-            or ""
-        ).lower()
-
-        if (
-            hostname == "max.ru"
-            or hostname.endswith(
-                ".max.ru"
-            )
-        ):
-            return True
-
-        return False
-
-    except Exception:
-
         return False
 
 
@@ -2280,51 +2104,25 @@ async def handle_photo(
         )
 
         return
-
     # -----------------------------------------------------
-    # DECODE QR
+    # CHECK QR
     # -----------------------------------------------------
 
-    qr_data = decode_qr(
-        image_bytes
-    )
-
-    if not qr_data:
+    if not contains_qr(image_bytes):
 
         logger.info(
-            "Изображение без читаемого QR: "
-            "%s (%s)",
+            "Изображение без QR: %s (%s)",
             user.full_name,
             user.id,
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # ONLY MAX.RU
-    # -----------------------------------------------------
-
-    if not is_max_ru_qr(
-        qr_data
-    ):
-
-        logger.info(
-            "QR не max.ru, игнорируем: "
-            "%s (%s) -> %s",
-            user.full_name,
-            user.id,
-            qr_data[:200],
         )
 
         return
 
     logger.info(
-        "Найден разрешённый max.ru QR: "
-        "%s (%s)",
+        "QR найден: %s (%s)",
         user.full_name,
         user.id,
     )
-
     # -----------------------------------------------------
     # HOLD
     # -----------------------------------------------------
@@ -2451,7 +2249,6 @@ async def handle_photo(
                 user_id,
                 username,
                 display_name,
-                qr_data,
                 sent_at,
                 counted
             )
@@ -2470,7 +2267,6 @@ async def handle_photo(
                 user.id,
                 username,
                 display_name,
-                qr_data,
                 now,
                 counted,
             ),

@@ -212,7 +212,7 @@ def ensure_group(chat_id: int, title: str = None):
             INSERT INTO groups
                 (chat_id, title, enabled, hold_minutes)
             VALUES
-                (%s, %s, 0, 10)
+                (%s, %s, FALSE, 10)
             ON CONFLICT (chat_id)
             DO NOTHING
             """,
@@ -1047,7 +1047,7 @@ async def admin_panel(
             cursor.execute(
                 """
                 UPDATE groups
-                SET enabled = 1
+                SET enabled = TRUE
                 WHERE chat_id = %s
                 """,
                 (chat_id,),
@@ -1101,7 +1101,7 @@ async def admin_panel(
             cursor.execute(
                 """
                 UPDATE groups
-                SET enabled = 0
+                SET enabled = FALSE
                 WHERE chat_id = %s
                 """,
                 (chat_id,),
@@ -2099,7 +2099,7 @@ async def enable_bot(
         cursor.execute(
             """
             UPDATE groups
-            SET enabled = 1
+            SET enabled = TRUE
             WHERE chat_id = %s
             """,
             (chat.id,),
@@ -2167,7 +2167,7 @@ async def disable_bot(
         cursor.execute(
             """
             UPDATE groups
-            SET enabled = 0
+            SET enabled = FALSE
             WHERE chat_id = %s
             """,
             (chat.id,),

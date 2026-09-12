@@ -5,3 +5,4 @@ bot.db
 *.log
 .vscode/
 .idea/
+migration.py

@@ -3,7 +3,6 @@ import os
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -1974,10 +1973,10 @@ async def handle_admin_input(
 
 def contains_qr(image_bytes: bytes) -> bool:
     """
-    Проверяет только наличие QR-кода.
-    Содержимое QR не декодируется.
+    Проверяет только наличие QR-кода на изображении.
+    Содержимое QR-кода НЕ декодируется.
+    URL, max.ru и другие данные НЕ проверяются.
     """
-
     try:
         image_array = np.frombuffer(
             image_bytes,
@@ -1994,31 +1993,50 @@ def contains_qr(image_bytes: bytes) -> bool:
 
         detector = cv2.QRCodeDetector()
 
-        images_to_try = [image]
-
         height, width = image.shape[:2]
 
-        if width > 0 and height > 0:
-            enlarged = cv2.resize(
-                image,
-                (
-                    width * 2,
-                    height * 2,
-                ),
-                interpolation=cv2.INTER_CUBIC,
-            )
+        if width <= 0 or height <= 0:
+            return False
 
-            images_to_try.append(enlarged)
+        images_to_try = [
+            image,
+        ]
 
-            gray = cv2.cvtColor(
-                enlarged,
-                cv2.COLOR_BGR2GRAY,
-            )
+        # Увеличенная версия
+        enlarged = cv2.resize(
+            image,
+            (
+                width * 2,
+                height * 2,
+            ),
+            interpolation=cv2.INTER_CUBIC,
+        )
 
-            images_to_try.append(gray)
+        images_to_try.append(enlarged)
 
+        # Чёрно-белая версия
+        gray = cv2.cvtColor(
+            enlarged,
+            cv2.COLOR_BGR2GRAY,
+        )
+
+        images_to_try.append(gray)
+
+        # Адаптивный порог
+        threshold = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            5,
+        )
+
+        images_to_try.append(threshold)
+
+        # Проверяем только геометрию QR.
+        # detect() НЕ декодирует содержимое.
         for current_image in images_to_try:
-
             try:
                 found, points = detector.detect(
                     current_image
@@ -2040,7 +2058,6 @@ def contains_qr(image_bytes: bytes) -> bool:
             "Ошибка contains_qr"
         )
         return False
-
 
 # =========================================================
 # PHOTO / QR
@@ -2104,20 +2121,18 @@ async def handle_photo(
         )
 
         return
-    # -----------------------------------------------------
+    # =====================================================
     # CHECK QR
-    # -----------------------------------------------------
-
+    # =====================================================
+    
     if not contains_qr(image_bytes):
-
         logger.info(
             "Изображение без QR: %s (%s)",
             user.full_name,
             user.id,
         )
-
         return
-
+    
     logger.info(
         "QR найден: %s (%s)",
         user.full_name,

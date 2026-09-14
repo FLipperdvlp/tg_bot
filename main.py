@@ -2722,11 +2722,9 @@ async def clear_stats(
         "🗑 Статистика очищена."
     )
 
-
 # =========================================================
 # MAIN
 # =========================================================
-
 def main():
 
     # -----------------------------------------------------
@@ -2734,6 +2732,104 @@ def main():
     # -----------------------------------------------------
 
     init_db()
+
+    # -----------------------------------------------------
+    # DAILY STATISTICS RESET
+    # -----------------------------------------------------
+
+    conn = get_db()
+
+    try:
+        cursor = conn.cursor()
+
+        # Таблица для хранения даты последнего сброса
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_state (
+                id INTEGER PRIMARY KEY,
+                stats_date DATE NOT NULL
+            )
+            """
+        )
+
+        # Дата по польскому времени
+        from zoneinfo import ZoneInfo
+
+        today = datetime.now(
+            ZoneInfo("Europe/Warsaw")
+        ).date()
+
+        cursor.execute(
+            """
+            SELECT stats_date
+            FROM bot_state
+            WHERE id = 1
+            """
+        )
+
+        row = cursor.fetchone()
+
+        # Первый запуск после добавления этой системы
+        if row is None:
+
+            cursor.execute(
+                """
+                INSERT INTO bot_state (
+                    id,
+                    stats_date
+                )
+                VALUES (
+                    1,
+                    %s
+                )
+                """,
+                (today,),
+            )
+
+            logger.info(
+                f"Daily statistics initialized: {today}"
+            )
+
+        # Наступил новый день
+        elif row["stats_date"] != today:
+
+            cursor.execute(
+                """
+                DELETE FROM qr_messages
+                """
+            )
+
+            cursor.execute(
+                """
+                UPDATE bot_state
+                SET stats_date = %s
+                WHERE id = 1
+                """,
+                (today,),
+            )
+
+            logger.info(
+                "New day detected. "
+                "Daily statistics have been reset."
+            )
+
+        else:
+
+            logger.info(
+                f"Daily statistics are already active for {today}"
+            )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+
+        logger.exception(
+            "Ошибка при обновлении ежедневной статистики"
+        )
+
+    finally:
+        conn.close()
 
     # -----------------------------------------------------
     # RENDER HEALTH SERVER

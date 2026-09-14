@@ -3,7 +3,7 @@ import os
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
+from zoneinfo import ZoneInfo
 import cv2
 import numpy as np
 import psycopg2
@@ -712,6 +712,90 @@ def get_group_statistics(chat_id: int):
     finally:
         conn.close()
 
+
+WARSAW_TZ = ZoneInfo("Europe/Warsaw")
+
+
+def reset_daily_statistics():
+    conn = get_db()
+
+    try:
+        cursor = conn.cursor()
+
+        today = datetime.now(WARSAW_TZ).date()
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_state (
+                id INTEGER PRIMARY KEY,
+                stats_date DATE NOT NULL
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            SELECT stats_date
+            FROM bot_state
+            WHERE id = 1
+            """
+        )
+
+        row = cursor.fetchone()
+
+        if row is None:
+            cursor.execute(
+                """
+                INSERT INTO bot_state (id, stats_date)
+                VALUES (1, %s)
+                """,
+                (today,)
+            )
+
+            conn.commit()
+
+            logger.info(
+                "Daily statistics initialized for %s",
+                today
+            )
+
+            return
+
+        last_date = row["stats_date"] if isinstance(row, dict) else row[0]
+
+        if last_date != today:
+            cursor.execute(
+                """
+                DELETE FROM qr_messages
+                """
+            )
+
+            cursor.execute(
+                """
+                UPDATE bot_state
+                SET stats_date = %s
+                WHERE id = 1
+                """,
+                (today,)
+            )
+
+            conn.commit()
+
+            logger.info(
+                "Daily statistics reset: %s -> %s",
+                last_date,
+                today
+            )
+
+    except Exception:
+        conn.rollback()
+        logger.exception("Failed to reset daily statistics")
+
+    finally:
+        conn.close()
+
+async def daily_statistics_job(context):
+    reset_daily_statistics()
 
 # =========================================================
 # MENUS
@@ -2725,6 +2809,7 @@ async def clear_stats(
 # =========================================================
 # MAIN
 # =========================================================
+
 def main():
 
     # -----------------------------------------------------
@@ -2733,103 +2818,10 @@ def main():
 
     init_db()
 
-    # -----------------------------------------------------
-    # DAILY STATISTICS RESET
-    # -----------------------------------------------------
-
-    conn = get_db()
-
-    try:
-        cursor = conn.cursor()
-
-        # Таблица для хранения даты последнего сброса
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bot_state (
-                id INTEGER PRIMARY KEY,
-                stats_date DATE NOT NULL
-            )
-            """
-        )
-
-        # Дата по польскому времени
-        from zoneinfo import ZoneInfo
-
-        today = datetime.now(
-            ZoneInfo("Europe/Warsaw")
-        ).date()
-
-        cursor.execute(
-            """
-            SELECT stats_date
-            FROM bot_state
-            WHERE id = 1
-            """
-        )
-
-        row = cursor.fetchone()
-
-        # Первый запуск после добавления этой системы
-        if row is None:
-
-            cursor.execute(
-                """
-                INSERT INTO bot_state (
-                    id,
-                    stats_date
-                )
-                VALUES (
-                    1,
-                    %s
-                )
-                """,
-                (today,),
-            )
-
-            logger.info(
-                f"Daily statistics initialized: {today}"
-            )
-
-        # Наступил новый день
-        elif row["stats_date"] != today:
-
-            cursor.execute(
-                """
-                DELETE FROM qr_messages
-                """
-            )
-
-            cursor.execute(
-                """
-                UPDATE bot_state
-                SET stats_date = %s
-                WHERE id = 1
-                """,
-                (today,),
-            )
-
-            logger.info(
-                "New day detected. "
-                "Daily statistics have been reset."
-            )
-
-        else:
-
-            logger.info(
-                f"Daily statistics are already active for {today}"
-            )
-
-        conn.commit()
-
-    except Exception:
-        conn.rollback()
-
-        logger.exception(
-            "Ошибка при обновлении ежедневной статистики"
-        )
-
-    finally:
-        conn.close()
+    # Проверяем дату при запуске.
+    # Если бот был выключен в момент 00:00,
+    # статистика сбросится сразу после запуска.
+    reset_daily_statistics()
 
     # -----------------------------------------------------
     # RENDER HEALTH SERVER
@@ -2848,6 +2840,25 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .build()
+    )
+
+    # -----------------------------------------------------
+    # DAILY STATISTICS RESET
+    # -----------------------------------------------------
+
+    # Проверяем дату каждую минуту.
+    #
+    # Если наступил новый день:
+    # qr_messages очищается автоматически.
+    #
+    # reset_daily_statistics() использует
+    # Europe/Warsaw, поэтому дата определяется
+    # по польскому времени.
+
+    application.job_queue.run_repeating(
+        daily_statistics_job,
+        interval=60,
+        first=60,
     )
 
     # -----------------------------------------------------
